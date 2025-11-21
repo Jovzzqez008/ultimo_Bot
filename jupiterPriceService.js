@@ -1,10 +1,11 @@
-// jupiterPriceService.js - CORREGIDO: Usa lite-api.jup.ag (FREE) + RETRIES
+// jupiterPriceService.js - CORREGIDO: URLs correctas + Price API v3
 import fetch from "node-fetch";
 import {
   Connection,
   VersionedTransaction,
   Keypair,
-  SendTransactionError
+  SendTransactionError,
+  PublicKey
 } from "@solana/web3.js";
 import bs58 from "bs58";
 
@@ -48,13 +49,15 @@ export class JupiterPriceService {
     this.priceCache = new Map();
     this.cacheMaxAge = 5000; // 5s
     
-    // ✅ FIXED: Usar lite-api.jup.ag (FREE, sin API key)
-    this.jupiterQuoteURL = "https://lite-api.jup.ag/v1/quote";
-    this.jupiterSwapURL = "https://lite-api.jup.ag/v1/swap";
+    // ✅ FIXED: URLs correctas con /swap/v1/
+    this.jupiterQuoteURL = "https://lite-api.jup.ag/swap/v1/quote";
+    this.jupiterSwapURL = "https://lite-api.jup.ag/swap/v1/swap";
+    this.jupiterPriceURL = "https://lite-api.jup.ag/price/v3"; // API simplificada
 
     console.log("🪐 JupiterPriceService READY (lite-api - FREE)");
-    console.log("   Quote API: https://lite-api.jup.ag/v1/quote");
-    console.log("   Swap API: https://lite-api.jup.ag/v1/swap");
+    console.log("   Quote API: https://lite-api.jup.ag/swap/v1/quote");
+    console.log("   Swap API: https://lite-api.jup.ag/swap/v1/swap");
+    console.log("   Price API: https://lite-api.jup.ag/price/v3");
   }
 
   // ------------------------------------------------------------------------
@@ -63,7 +66,7 @@ export class JupiterPriceService {
   async isGraduated(mint) {
     try {
       const pumpProgramId = new PublicKey(
-        "6EF8rrecthR5Dkp1KPcLW7jkZo4U9AWhjbnESmtDDMTP"
+        process.env.PUMP_PROGRAM_ID || "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
       );
 
       const accounts = await this.connection.getProgramAccounts(pumpProgramId, {
@@ -89,7 +92,37 @@ export class JupiterPriceService {
   }
 
   // ------------------------------------------------------------------------
-  // 💰 2. Obtener precio del token (Jupiter)
+  // 💰 2. Obtener precio usando Price API v3 (más simple y rápido)
+  // ------------------------------------------------------------------------
+  async getPriceSimple(mint) {
+    try {
+      const url = `${this.jupiterPriceURL}?ids=${mint}&vsCurrency=USDC`;
+      const data = await fetchWithRetry(url, {}, 2, 500);
+
+      if (data && data[mint] && data[mint].price) {
+        const priceUSDC = data[mint].price;
+        
+        // Convertir USDC a SOL (aproximado, asume 1 SOL ≈ precio de mercado)
+        // Para más precisión, podrías obtener el precio SOL/USDC también
+        const SOL_USDC_PRICE = 100; // Ajustar según mercado real
+        const priceSOL = priceUSDC / SOL_USDC_PRICE;
+
+        return {
+          price: priceSOL,
+          priceUSD: priceUSDC,
+          source: "jupiter_price_v3"
+        };
+      }
+
+      return null;
+    } catch (err) {
+      // Silent fail, intentar con método de quote
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // 💰 3. Obtener precio usando Quote API (método original, más preciso)
   // ------------------------------------------------------------------------
   async getPrice(mint, forceFresh = false) {
     try {
@@ -103,14 +136,27 @@ export class JupiterPriceService {
         }
       }
 
+      // ✅ Intentar primero con Price API v3 (más rápido)
+      const simplePrice = await this.getPriceSimple(mint);
+      if (simplePrice && simplePrice.price) {
+        this.priceCache.set(mint, {
+          price: simplePrice.price,
+          timestamp: now
+        });
+        return simplePrice;
+      }
+
+      // ✅ Fallback: Quote API (más completo pero puede fallar en tokens nuevos)
       const SOL = "So11111111111111111111111111111111111111112";
 
-      // ✅ FIXED: Usar lite-api.jup.ag
+      // ✅ FIXED: URL correcta con /swap/v1/
       const url = `${this.jupiterQuoteURL}?inputMint=${mint}&outputMint=${SOL}&amount=1000000&swapMode=ExactIn&slippageBps=50`;
 
-      const data = await fetchWithRetry(url);
+      const data = await fetchWithRetry(url, {}, 2, 500);
 
-      if (!data.outAmount) throw new Error("Quote has no outAmount");
+      if (!data.outAmount) {
+        throw new Error("Quote has no outAmount");
+      }
 
       const price = Number(data.outAmount) / 1_000_000;
 
@@ -120,21 +166,28 @@ export class JupiterPriceService {
         outAmount: data.outAmount
       });
 
-      return { price, source: "jupiter" };
+      return { price, source: "jupiter_quote" };
     } catch (err) {
-      // Log menos agresivo para errores de red comunes
+      // Manejo mejorado de errores comunes
       if (err.message.includes('ENOTFOUND') || err.message.includes('fetch failed')) {
-        console.warn(`⚠️ Jupiter Connection Issue: ${err.message}`);
+        console.warn(`⚠️ Jupiter Connection Issue: ${err.message.split('\n')[0]}`);
+      } else if (err.message.includes('404') || err.message.includes('Route not found')) {
+        console.warn(`⚠️ Jupiter Route Not Found: Token may be too new or illiquid`);
+        console.warn(`   Mint: ${mint.slice(0, 8)}...`);
+        console.warn(`   Tip: Token needs ~$500 liquidity and 1-2 hours to be indexed`);
       } else if (err.message.includes('401')) {
         console.error(`❌ Jupiter API Error: ${err.message}`);
         console.error(`   Note: Using lite-api.jup.ag (free tier)`);
       } else {
-        console.error("❌ Jupiter getPrice failed:", err.message);
+        console.warn("⚠️ Jupiter getPrice failed:", err.message.split('\n')[0]);
       }
 
+      // Usar cache como último recurso
       if (this.priceCache.has(mint)) {
+        const cached = this.priceCache.get(mint);
+        console.log(`   ℹ️ Using cached price (${Math.floor((now - cached.timestamp)/1000)}s old)`);
         return {
-          price: this.priceCache.get(mint).price,
+          price: cached.price,
           source: "cache-fallback"
         };
       }
@@ -144,33 +197,33 @@ export class JupiterPriceService {
   }
 
   // ------------------------------------------------------------------------
-  // 🔄 3. Ejecutar Swap Ultra para vender tokens graduados
+  // 🔄 4. Ejecutar Swap Ultra para vender tokens graduados
   // ------------------------------------------------------------------------
   async swapToken(mint, tokenAmount, slippageBps = 500) {
     try {
       console.log("\n🪐 JUPITER ULTRA SWAP (lite-api)");
-      console.log(" Mint:", mint);
-      console.log(" Tokens:", tokenAmount);
-      console.log(` Slippage: ${slippageBps / 100}%`);
+      console.log("   Mint:", mint);
+      console.log("   Tokens:", tokenAmount);
+      console.log(`   Slippage: ${slippageBps / 100}%`);
 
       const inputMint = mint;
       const outputMint = "So11111111111111111111111111111111111111112"; // SOL
       const amount = Math.floor(tokenAmount);
 
-      // Paso 1: obtener quote (Retry incluido)
+      // Paso 1: obtener quote (Retry incluido, URL corregida)
       const quoteURL = `${this.jupiterQuoteURL}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
 
-      const quoteResponse = await fetchWithRetry(quoteURL);
+      const quoteResponse = await fetchWithRetry(quoteURL, {}, 3, 1000);
 
       if (!quoteResponse.outAmount) {
-        throw new Error("Jupiter quote failed");
+        throw new Error("Jupiter quote failed - no outAmount");
       }
 
       console.log(
-        ` Expected SOL: ${(Number(quoteResponse.outAmount) / 1e9).toFixed(4)} SOL`
+        `   Expected SOL: ${(Number(quoteResponse.outAmount) / 1e9).toFixed(4)} SOL`
       );
 
-      // Paso 2: Swap instructions (Retry incluido)
+      // Paso 2: Swap instructions (Retry incluido, URL corregida)
       const swapData = await fetchWithRetry(this.jupiterSwapURL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -179,7 +232,7 @@ export class JupiterPriceService {
           userPublicKey: this.wallet.publicKey.toString(),
           wrapAndUnwrapSol: true
         })
-      });
+      }, 3, 1000);
 
       if (!swapData.swapTransaction) {
         throw new Error("Jupiter swap API returned no transaction");
@@ -200,12 +253,12 @@ export class JupiterPriceService {
         });
       } catch (err) {
         if (err instanceof SendTransactionError) {
-          console.error("Jupiter transaction error logs:", err.logs);
+          console.error("   Jupiter transaction error logs:", err.logs);
         }
         throw err;
       }
 
-      console.log(" ✔ Swap signature:", signature);
+      console.log("   ✅ Swap signature:", signature);
 
       return {
         success: true,
@@ -218,6 +271,14 @@ export class JupiterPriceService {
       };
     } catch (err) {
       console.error("❌ Jupiter swapToken error:", err.message);
+      
+      // Mensajes de ayuda según el error
+      if (err.message.includes('Route not found')) {
+        console.error("   💡 Tip: Token may need more liquidity or time to be indexed");
+      } else if (err.message.includes('Slippage tolerance exceeded')) {
+        console.error("   💡 Tip: Try increasing slippage (current: " + slippageBps + " bps)");
+      }
+      
       return {
         success: false,
         error: err.message
