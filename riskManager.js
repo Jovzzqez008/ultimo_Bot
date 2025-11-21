@@ -1,4 +1,4 @@
-// riskManager.js - Sistema de gestión de riesgo con PnL MEJORADO
+// riskManager.js - Sistema de gestión de riesgo con PnL MEJORADO 
 import IORedis from 'ioredis';
 import { PnLCalculator } from './pnlCalculator.js';
 
@@ -224,7 +224,8 @@ export class PositionManager {
       
       await this.redis.hmset(`position:${mint}`, position);
       await this.redis.sadd('open_positions', mint);
-      await this.redis.expire(`position:${mint}`, 3600);
+      // ❌ NO ponemos expire aquí: la posición se mantiene hasta que se cierre
+      // await this.redis.expire(`position:${mint}`, 3600);
       
       console.log(`✅ Position opened: ${symbol} @ $${entryPrice.toFixed(10)}`);
       return position;
@@ -250,7 +251,7 @@ export class PositionManager {
     }
   }
 
-  // ✅ NUEVO: closePosition usando PnLCalculator (SOL-based correcto)
+  // ✅ closePosition usando PnLCalculator (SOL-based correcto)
   async closePosition(mint, exitPrice, tokensAmount, solReceived, reason, signature) {
     try {
       const position = await this.redis.hgetall(`position:${mint}`);
@@ -265,16 +266,13 @@ export class PositionManager {
         ? tokensAmount
         : parseFloat(tokensAmount);
 
-      // ✅ USAR CALCULADORA PnL CORRECTA (basado en SOL, con fees)
+      // ✅ USAR CALCULADORA PnL CORRECTA (basado en SOL, con fees internas)
       const trade = {
         entryPrice,
         exitPrice,
         tokenAmount: tokenAmountNum,
-        solSpent,
-        fees: {
-          buyFee: parseFloat(process.env.BUY_FEE_PERCENT || '0.01'),
-          sellFee: parseFloat(process.env.SELL_FEE_PERCENT || '0.01')
-        }
+        solSpent
+        // executor/slippage/networkFee/priorityFee los maneja quien llama si quiere
       };
 
       const pnlResult = PnLCalculator.calculatePnL(trade);
@@ -351,7 +349,7 @@ export class PositionManager {
     }
   }
 
-  // ✅ Calcular PnL actual de posición abierta (lo dejamos como estaba)
+  // ✅ Calcular PnL actual de posición abierta (método antiguo, lo dejamos)
   async calculateCurrentPnL(mint, currentPrice) {
     try {
       const position = await this.redis.hgetall(`position:${mint}`);
