@@ -3,8 +3,8 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import fetch from 'node-fetch';
 import { JupiterPriceService } from './jupiterPriceService.js';
 
-// Program ID de Pump.fun (el de tu snippet de método 2)
-const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+// ✅ Program ID CORRECTO de Pump.fun
+const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkp1KPcLW7jkZo4U9AWhjbnESmtDDMTP');
 const PUMP_CURVE_SEED = Buffer.from('bonding-curve');
 const PUMP_TOKEN_DECIMALS = 6;
 const LAMPORTS_PER_SOL = 1e9;
@@ -29,6 +29,7 @@ class PriceService {
 
     console.log('💵 PriceService initialized');
     console.log(` RPC: ${this.rpcUrl}`);
+    console.log(` Pump.fun Program ID: ${PUMP_PROGRAM_ID.toBase58()}`);
   }
 
   // ------------------------------------------------------------------
@@ -138,7 +139,7 @@ class PriceService {
   }
 
   // ------------------------------------------------------------------
-  // 🧮 Pump.fun bonding curve (MÉTODO 2 que me pasaste)
+  // 🧮 Pump.fun bonding curve
   // ------------------------------------------------------------------
 
   /**
@@ -154,7 +155,6 @@ class PriceService {
 
   /**
    * Leer el estado de la bonding curve + calcular precio + progreso
-   * Implementa exactamente tu Método 2 (Anchor IDL manual)
    */
   async getPumpFunPrice(tokenMint) {
     const curveAddress = this.findBondingCurveAddress(tokenMint);
@@ -174,7 +174,7 @@ class PriceService {
       console.warn('⚠️ Bonding curve account signature mismatch (IDL discriminator)');
     }
 
-    // Layout según tu snippet
+    // Layout según el IDL
     const virtualTokenReserves = data.readBigUInt64LE(0x08);
     const virtualSolReserves = data.readBigUInt64LE(0x10);
     const realTokenReserves = data.readBigUInt64LE(0x18);
@@ -191,7 +191,7 @@ class PriceService {
 
     const price = virtualSol / virtualTokens;
 
-    // Progreso de bonding (opcional, igual que tu ejemplo)
+    // Progreso de bonding
     const INITIAL_REAL_TOKEN_RESERVES = 793100000000000n;
     let bondingProgress = 0;
     if (realTokenReserves < INITIAL_REAL_TOKEN_RESERVES) {
