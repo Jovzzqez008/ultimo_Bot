@@ -1,4 +1,4 @@
-// jupiterPriceService.js - CORREGIDO: URLs correctas + Price API v3
+// jupiterPriceService.js - CORREGIDO: URLs correctas + Price API v3 + decimales auto-detectados
 import fetch from "node-fetch";
 import {
   Connection,
@@ -48,7 +48,10 @@ export class JupiterPriceService {
     // Cache
     this.priceCache = new Map();
     this.cacheMaxAge = 5000; // 5s
-    
+
+    // Cache de decimales por mint
+    this.decimalsCache = new Map();
+
     // ✅ FIXED: URLs correctas con /swap/v1/
     this.jupiterQuoteURL = "https://lite-api.jup.ag/swap/v1/quote";
     this.jupiterSwapURL = "https://lite-api.jup.ag/swap/v1/swap";
@@ -61,12 +64,45 @@ export class JupiterPriceService {
   }
 
   // ------------------------------------------------------------------------
+  // Helper: obtener decimales reales de la mint (auto, sin env)
+  // ------------------------------------------------------------------------
+  async getTokenDecimals(mintStr) {
+    if (this.decimalsCache.has(mintStr)) {
+      return this.decimalsCache.get(mintStr);
+    }
+
+    try {
+      const mintPubkey = new PublicKey(mintStr);
+      const info = await this.connection.getParsedAccountInfo(mintPubkey);
+
+      const decimals =
+        info?.value?.data?.parsed?.info?.decimals ?? 6; // fallback 6
+
+      this.decimalsCache.set(mintStr, decimals);
+      console.log(
+        `   🔍 Decimals for ${mintStr.slice(0, 8)}...: ${decimals}`
+      );
+      return decimals;
+    } catch (err) {
+      console.warn(
+        `   ⚠️ Could not fetch decimals for ${mintStr.slice(
+          0,
+          8
+        )}... using 6 as fallback: ${err.message}`
+      );
+      this.decimalsCache.set(mintStr, 6);
+      return 6;
+    }
+  }
+
+  // ------------------------------------------------------------------------
   // 🎓 1. Detectar si un token está graduado
   // ------------------------------------------------------------------------
   async isGraduated(mint) {
     try {
       const pumpProgramId = new PublicKey(
-        process.env.PUMP_PROGRAM_ID || "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+        process.env.PUMP_PROGRAM_ID ||
+          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
       );
 
       const accounts = await this.connection.getProgramAccounts(pumpProgramId, {
@@ -101,7 +137,7 @@ export class JupiterPriceService {
 
       if (data && data[mint] && data[mint].price) {
         const priceUSDC = data[mint].price;
-        
+
         // Convertir USDC a SOL (aproximado, asume 1 SOL ≈ precio de mercado)
         // Para más precisión, podrías obtener el precio SOL/USDC también
         const SOL_USDC_PRICE = 100; // Ajustar según mercado real
@@ -169,23 +205,31 @@ export class JupiterPriceService {
       return { price, source: "jupiter_quote" };
     } catch (err) {
       // Manejo mejorado de errores comunes
-      if (err.message.includes('ENOTFOUND') || err.message.includes('fetch failed')) {
-        console.warn(`⚠️ Jupiter Connection Issue: ${err.message.split('\n')[0]}`);
-      } else if (err.message.includes('404') || err.message.includes('Route not found')) {
-        console.warn(`⚠️ Jupiter Route Not Found: Token may be too new or illiquid`);
+      if (err.message.includes("ENOTFOUND") || err.message.includes("fetch failed")) {
+        console.warn(`⚠️ Jupiter Connection Issue: ${err.message.split("\n")[0]}`);
+      } else if (err.message.includes("404") || err.message.includes("Route not found")) {
+        console.warn(
+          `⚠️ Jupiter Route Not Found: Token may be too new or illiquid`
+        );
         console.warn(`   Mint: ${mint.slice(0, 8)}...`);
-        console.warn(`   Tip: Token needs ~$500 liquidity and 1-2 hours to be indexed`);
-      } else if (err.message.includes('401')) {
+        console.warn(
+          `   Tip: Token needs ~$500 liquidity and 1-2 hours to be indexed`
+        );
+      } else if (err.message.includes("401")) {
         console.error(`❌ Jupiter API Error: ${err.message}`);
         console.error(`   Note: Using lite-api.jup.ag (free tier)`);
       } else {
-        console.warn("⚠️ Jupiter getPrice failed:", err.message.split('\n')[0]);
+        console.warn("⚠️ Jupiter getPrice failed:", err.message.split("\n")[0]);
       }
 
       // Usar cache como último recurso
       if (this.priceCache.has(mint)) {
         const cached = this.priceCache.get(mint);
-        console.log(`   ℹ️ Using cached price (${Math.floor((now - cached.timestamp)/1000)}s old)`);
+        console.log(
+          `   ℹ️ Using cached price (${Math.floor(
+            (now - cached.timestamp) / 1000
+          )}s old)`
+        );
         return {
           price: cached.price,
           source: "cache-fallback"
@@ -203,12 +247,20 @@ export class JupiterPriceService {
     try {
       console.log("\n🪐 JUPITER ULTRA SWAP (lite-api)");
       console.log("   Mint:", mint);
-      console.log("   Tokens:", tokenAmount);
+      console.log("   Tokens (UI):", tokenAmount);
       console.log(`   Slippage: ${slippageBps / 100}%`);
 
       const inputMint = mint;
-      const outputMint = "So11111111111111111111111111111111111111112"; // SOL
-      const amount = Math.floor(tokenAmount);
+      const outputMint =
+        "So11111111111111111111111111111111111111112"; // SOL
+
+      // ✅ FIX: obtener decimales reales desde la mint (auto)
+      const decimals = await this.getTokenDecimals(inputMint);
+      const rawAmount = Number(tokenAmount) * 10 ** decimals;
+      const amount = Math.floor(rawAmount);
+
+      console.log(`   Decimals detectados: ${decimals}`);
+      console.log(`   Amount (base units): ${amount}`);
 
       // Paso 1: obtener quote (Retry incluido, URL corregida)
       const quoteURL = `${this.jupiterQuoteURL}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
@@ -220,19 +272,26 @@ export class JupiterPriceService {
       }
 
       console.log(
-        `   Expected SOL: ${(Number(quoteResponse.outAmount) / 1e9).toFixed(4)} SOL`
+        `   Expected SOL: ${(Number(quoteResponse.outAmount) / 1e9).toFixed(
+          4
+        )} SOL`
       );
 
       // Paso 2: Swap instructions (Retry incluido, URL corregida)
-      const swapData = await fetchWithRetry(this.jupiterSwapURL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          quoteResponse: quoteResponse,
-          userPublicKey: this.wallet.publicKey.toString(),
-          wrapAndUnwrapSol: true
-        })
-      }, 3, 1000);
+      const swapData = await fetchWithRetry(
+        this.jupiterSwapURL,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            quoteResponse: quoteResponse,
+            userPublicKey: this.wallet.publicKey.toString(),
+            wrapAndUnwrapSol: true
+          })
+        },
+        3,
+        1000
+      );
 
       if (!swapData.swapTransaction) {
         throw new Error("Jupiter swap API returned no transaction");
@@ -271,14 +330,20 @@ export class JupiterPriceService {
       };
     } catch (err) {
       console.error("❌ Jupiter swapToken error:", err.message);
-      
+
       // Mensajes de ayuda según el error
-      if (err.message.includes('Route not found')) {
-        console.error("   💡 Tip: Token may need more liquidity or time to be indexed");
-      } else if (err.message.includes('Slippage tolerance exceeded')) {
-        console.error("   💡 Tip: Try increasing slippage (current: " + slippageBps + " bps)");
+      if (err.message.includes("Route not found")) {
+        console.error(
+          "   💡 Tip: Token may need more liquidity or time to be indexed"
+        );
+      } else if (err.message.includes("Slippage tolerance exceeded")) {
+        console.error(
+          "   💡 Tip: Try increasing slippage (current: " +
+            slippageBps +
+            " bps)"
+        );
       }
-      
+
       return {
         success: false,
         error: err.message
