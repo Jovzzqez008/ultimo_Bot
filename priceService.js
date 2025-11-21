@@ -1,4 +1,4 @@
-// priceService.js - Servicio de precios unificado Pump.fun + Jupiter
+// priceService.js - Servicio de precios unificado Pump.fun + Jupiter (lite-api)
 import { Connection, PublicKey } from '@solana/web3.js';
 import fetch from 'node-fetch';
 import { JupiterPriceService } from './jupiterPriceService.js';
@@ -30,6 +30,7 @@ class PriceService {
     console.log('💵 PriceService initialized');
     console.log(` RPC: ${this.rpcUrl}`);
     console.log(` Pump.fun Program ID: ${PUMP_PROGRAM_ID.toBase58()}`);
+    console.log(` Jupiter: lite-api.jup.ag (FREE tier)`);
   }
 
   // ------------------------------------------------------------------
