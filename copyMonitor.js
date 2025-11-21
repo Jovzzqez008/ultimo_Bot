@@ -34,6 +34,11 @@ let positionManager;
 let pumpPortal = null;
 let jupiterService = null;
 
+// helper pequeño para delays
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 if (ENABLE_TRADING) {
   try {
     const { PositionManager } = await import('./riskManager.js');
@@ -672,6 +677,9 @@ async function monitorOpenPositions() {
   }
 }
 
+// 🧠 AQUÍ VAN LOS CAMBIOS IMPORTANTES:
+// - Delay opcional después de la graduación antes de usar Jupiter
+// - Fallback a PumpPortal si Jupiter no tiene ruta o da 0x1789
 async function executeSell(position, currentPrice, _currentSolValue, reason) {
   try {
     const tokensAmount = parseInt(position.tokensAmount);
@@ -682,13 +690,33 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
     });
     const exitPrice =
       priceInfo && priceInfo.price ? priceInfo.price : currentPrice;
-    const isGraduated = priceInfo && priceInfo.graduated;
+    const isGraduatedFlag = priceInfo && priceInfo.graduated;
+
+    // Delay opcional después de que la bonding curve marca "complete"
+    let useJupiter = isGraduatedFlag;
+    const gradTimeStr = position.graduationTime;
+    const gradDelaySec = Number(process.env.JUPITER_GRAD_DELAY_SEC || '0');
+
+    if (useJupiter && gradTimeStr && gradDelaySec > 0) {
+      const gradTime = parseInt(gradTimeStr);
+      const elapsedSec = (Date.now() - gradTime) / 1000;
+
+      if (elapsedSec < gradDelaySec) {
+        const waitSec = Math.max(0, gradDelaySec - elapsedSec);
+        console.log(
+          `\n⏳ Jupiter route warmup: waiting ${waitSec.toFixed(
+            1,
+          )}s before first Jupiter sell...`,
+        );
+        await sleep(waitSec * 1000);
+      }
+    }
 
     let sellResult;
     let executor;
     let executorLabel;
 
-    if (!isGraduated) {
+    if (!useJupiter) {
       // ✅ VENTA EN PUMP.FUN via PumpPortal Local API
       sellResult = await pumpPortal.sellToken(
         position.mint,
@@ -707,6 +735,31 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
       );
       executor = 'jupiter';
       executorLabel = 'Jupiter Ultra Swap (~0.3%)';
+
+      // 🔁 FALLBACK: si Jupiter falla por falta de ruta / error 0x1789, volver a PumpPortal
+      const errorMsg = sellResult && sellResult.error ? sellResult.error : '';
+      const routeError =
+        !sellResult.success &&
+        (errorMsg.includes('Route not found') ||
+          errorMsg.includes('COULD_NOT_FIND_ANY_ROUTE') ||
+          errorMsg.includes('Could not find any route') ||
+          errorMsg.includes('custom program error: 0x1789'));
+
+      if (routeError) {
+        console.log(
+          '\n⚠️ Jupiter route not ready / simulation failed. Falling back to PumpPortal for this sell.',
+        );
+
+        sellResult = await pumpPortal.sellToken(
+          position.mint,
+          tokensAmount,
+          Number(process.env.COPY_SLIPPAGE || '10'),
+          Number(process.env.PRIORITY_FEE || '0.0005'),
+        );
+
+        executor = 'pumpportal';
+        executorLabel = 'Pump.fun (PumpPortal Local API - 1.75%)';
+      }
     }
 
     if (sellResult.success) {
