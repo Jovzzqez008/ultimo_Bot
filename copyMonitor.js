@@ -689,7 +689,7 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
     let executorLabel;
 
     if (!isGraduated) {
-      // ✅ VENTA EN PUMP.FUN via PumpPortal Local API
+      // ✅ VENTA EN PUMP.FUN via PumpPortal Local API (PumpPortal maneja DRY_RUN internamente)
       sellResult = await pumpPortal.sellToken(
         position.mint,
         tokensAmount,
@@ -700,13 +700,28 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
       executorLabel = 'Pump.fun (PumpPortal Local API - 1.75%)';
     } else {
       // ✅ VENTA EN JUPITER (TOKEN GRADUADO)
-      sellResult = await jupiterService.swapToken(
-        position.mint,
-        tokensAmount,
-        Number(process.env.JUPITER_SLIPPAGE_BPS || '500'),
-      );
       executor = 'jupiter';
       executorLabel = 'Jupiter Ultra Swap (~0.3%)';
+
+      // 🔥 CORRECCIÓN: Verificar DRY_RUN antes de llamar a Jupiter
+      if (DRY_RUN) {
+        console.log(`\n📄 SIMULATING JUPITER SELL (DRY RUN)`);
+        sellResult = {
+          success: true,
+          signature: 'simulated_jupiter_tx_' + Date.now(),
+          solReceived: tokensAmount * exitPrice, // Estimado sin fees para simulación
+          expectedSOL: tokensAmount * exitPrice,
+          priceImpact: 0,
+          tokenAmount: tokensAmount
+        };
+      } else {
+        // Solo si NO es DRY_RUN, llamamos a la API real
+        sellResult = await jupiterService.swapToken(
+          position.mint,
+          tokensAmount,
+          Number(process.env.JUPITER_SLIPPAGE_BPS || '500'),
+        );
+      }
     }
 
     if (sellResult.success) {
