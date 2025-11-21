@@ -1,4 +1,4 @@
-// telegram.js - FIXED: Comandos /positions y /sell con Price Service + PumpPortalExecutor
+// telegram.js - FIXED: Constructor correcto para PumpPortalExecutor
 import TelegramBot from 'node-telegram-bot-api';
 import IORedis from 'ioredis';
 import { getPriceService } from './priceService.js';
@@ -102,7 +102,7 @@ export async function initTelegram() {
           const position = await redis.hgetall(`position:${mint}`);
           if (position && position.strategy === 'copy') {
             const entryPrice = parseFloat(position.entryPrice);
-            const priceData = await priceService.getPriceWithFallback(mint);
+            const priceData = await priceService.getPrice(mint, { forceFresh: true });
 
             if (priceData && priceData.price && !isNaN(priceData.price)) {
               const pnlPercent =
@@ -158,8 +158,7 @@ export async function initTelegram() {
           const entryPrice = parseFloat(pos.entryPrice);
 
           // ✅ USAR PRICE SERVICE
-          const priceData =
-            await priceService.getPriceWithFallback(pos.mint);
+          const priceData = await priceService.getPrice(pos.mint, { forceFresh: true });
 
           let currentPrice = entryPrice; // Fallback
           let isGraduated = false;
@@ -168,7 +167,7 @@ export async function initTelegram() {
             currentPrice = priceData.price;
             isGraduated =
               priceData.graduated ||
-              priceData.source === 'jupiter_dex';
+              priceData.source === 'jupiter';
           } else {
             console.log(
               `   ⚠️ Using entry price as fallback for ${pos.mint.slice(
@@ -201,7 +200,7 @@ export async function initTelegram() {
           message += `PnL: ${pnl}% | ${pnlSOL.toFixed(4)} SOL\n`;
           message += `Hold: ${holdTime}s | Votes: ${upvotes}\n`;
           if (isGraduated) {
-            message += `Status: GRADUATED (DEX price source)\n`;
+            message += `Status: GRADUATED (DEX price)\n`;
           }
           message += `/sell ${pos.mint.slice(0, 8)}\n\n`;
         }
@@ -212,7 +211,7 @@ export async function initTelegram() {
       }
     });
 
-    // ✅ /sell usando PumpPortalExecutor (Lightning API)
+    // ✅ /sell con constructor CORRECTO
     bot.onText(/\/sell(?:\s+(.+))?/, async (msg, match) => {
       const chatId = msg.chat.id;
 
@@ -259,14 +258,13 @@ export async function initTelegram() {
         }
 
         // ✅ PRICE SERVICE para PnL y detectar graduation
-        const priceData =
-          await priceService.getPriceWithFallback(targetMint);
+        const priceData = await priceService.getPrice(targetMint, { forceFresh: true });
 
         if (!priceData || !priceData.price || isNaN(priceData.price)) {
           return safeSend(
             chatId,
             `❌ Could not get current price\n` +
-              `Token may be graduated - try again in a moment`
+              `Token may be graduated - try again`
           );
         }
 
@@ -276,24 +274,21 @@ export async function initTelegram() {
           ((currentPrice - entryPrice) / entryPrice) * 100;
         const isGraduated =
           priceData.graduated ||
-          priceData.source === 'jupiter_dex';
+          priceData.source === 'jupiter';
 
-        // ✅ Ejecutar venta vía PumpPortalExecutor
-        const { PumpPortalExecutor } = await import(
-          './pumpPortalExecutor.js'
-        );
+        // ✅ Constructor CORRECTO
+        const { PumpPortalExecutor } = await import('./pumpPortalExecutor.js');
         const { PositionManager } = await import('./riskManager.js');
 
-        const dryRun = process.env.DRY_RUN !== 'false';
-        const tradeExecutor = new PumpPortalExecutor(
-          process.env.PRIVATE_KEY,
-          process.env.RPC_URL,
-          dryRun
-        );
+        const tradeExecutor = new PumpPortalExecutor({
+          RPC_URL: process.env.RPC_URL,
+          PRIVATE_KEY: process.env.PRIVATE_KEY,
+          DRY_RUN: process.env.DRY_RUN,
+        });
 
         const dexLabel = isGraduated
-          ? 'DEX (graduated via PumpPortal)'
-          : 'Pump.fun';
+          ? 'Jupiter (graduated)'
+          : 'Pump.fun (Local API)';
 
         console.log(`\n💰 Manual sell: ${targetMint.slice(0, 8)}`);
         console.log(`   Graduated: ${isGraduated}`);
@@ -302,8 +297,8 @@ export async function initTelegram() {
         const sellResult = await tradeExecutor.sellToken(
           targetMint,
           parseInt(position.tokensAmount),
-          'auto',
-          0.15
+          Number(process.env.COPY_SLIPPAGE || '10'),
+          Number(process.env.PRIORITY_FEE || '0.0005')
         );
 
         if (sellResult.success) {
@@ -317,7 +312,7 @@ export async function initTelegram() {
             sellResult.signature
           );
 
-          const mode = dryRun ? '📝 PAPER' : '💰 LIVE';
+          const mode = process.env.DRY_RUN !== 'false' ? '📝 PAPER' : '💰 LIVE';
           const graduatedTag = isGraduated ? ' 🎓' : '';
 
           await safeSend(
@@ -346,7 +341,7 @@ export async function initTelegram() {
       }
     });
 
-    // ✅ /sell_all usando PumpPortalExecutor
+    // ✅ /sell_all con constructor CORRECTO
     bot.onText(/\/sell_all/, async (msg) => {
       const chatId = msg.chat.id;
 
@@ -369,23 +364,21 @@ export async function initTelegram() {
           return safeSend(chatId, '🔭 No positions to close');
         }
 
-        const { PumpPortalExecutor } = await import(
-          './pumpPortalExecutor.js'
-        );
-        const dryRun = process.env.DRY_RUN !== 'false';
-        const tradeExecutor = new PumpPortalExecutor(
-          process.env.PRIVATE_KEY,
-          process.env.RPC_URL,
-          dryRun
-        );
+        // ✅ Constructor CORRECTO
+        const { PumpPortalExecutor } = await import('./pumpPortalExecutor.js');
+        
+        const tradeExecutor = new PumpPortalExecutor({
+          RPC_URL: process.env.RPC_URL,
+          PRIVATE_KEY: process.env.PRIVATE_KEY,
+          DRY_RUN: process.env.DRY_RUN,
+        });
 
         let closed = 0;
         let failed = 0;
 
         for (const position of copyPositions) {
           try {
-            const priceData =
-              await priceService.getPriceWithFallback(position.mint);
+            const priceData = await priceService.getPrice(position.mint, { forceFresh: true });
 
             if (!priceData || !priceData.price) {
               failed++;
@@ -394,13 +387,13 @@ export async function initTelegram() {
 
             const isGraduated =
               priceData.graduated ||
-              priceData.source === 'jupiter_dex';
+              priceData.source === 'jupiter';
 
             const sellResult = await tradeExecutor.sellToken(
               position.mint,
               parseInt(position.tokensAmount),
-              'auto',
-              0.15
+              Number(process.env.COPY_SLIPPAGE || '10'),
+              Number(process.env.PRIORITY_FEE || '0.0005')
             );
 
             if (sellResult.success) {
