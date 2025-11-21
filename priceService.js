@@ -1,13 +1,13 @@
-// priceService.js - Servicio de precios unificado con mejor manejo de errores
+// priceService.js - Servicio de precios unificado con RAW Pump.fun + Jupiter + DexScreener
 import { Connection, PublicKey } from '@solana/web3.js';
 import fetch from 'node-fetch';
 import { JupiterPriceService } from './jupiterPriceService.js';
+import PumpPriceReaderRaw from './pumpPriceReaderRaw.js';
 
-// ✅ Program ID CORRECTO de Pump.fun
-const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkp1KPcLW7jkZo4U9AWhjbnESmtDDMTP');
-const PUMP_CURVE_SEED = Buffer.from('bonding-curve');
-const PUMP_TOKEN_DECIMALS = 6;
-const LAMPORTS_PER_SOL = 1e9;
+// ✅ Program ID CORRECTO de Pump.fun (solo para logs)
+const PUMP_PROGRAM_ID = new PublicKey(
+  '6EF8rrecthR5Dkp1KPcLW7jkZo4U9AWhjbnESmtDDMTP',
+);
 
 // DexScreener como fallback remoto
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens';
@@ -15,7 +15,12 @@ const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens';
 class PriceService {
   constructor(config) {
     this.rpcUrl = config.RPC_URL;
-    this.connection = new Connection(this.rpcUrl, { commitment: 'confirmed' });
+    this.connection = new Connection(this.rpcUrl, {
+      commitment: 'confirmed',
+    });
+
+    // ✅ Nuevo: lector RAW de Pump.fun bonding curve
+    this.pumpRaw = new PumpPriceReaderRaw(this.rpcUrl);
 
     // Jupiter para graduados / fallback
     this.jupiter = new JupiterPriceService({
@@ -26,7 +31,7 @@ class PriceService {
     // Caches simples
     this.priceCache = new Map(); // mint -> { price, source, ts }
     this.cacheMs = 5000; // 5 seg
-    
+
     // Contador de intentos fallidos por mint (para evitar spam)
     this.failedAttempts = new Map(); // mint -> { count, lastAttempt }
     this.maxFailedAttempts = 3;
@@ -45,9 +50,9 @@ class PriceService {
 
   /**
    * Obtener precio de un token:
-   * - Primero intenta Pump.fun bonding curve (si sigue en Pump.fun)
+   * - Primero intenta Pump.fun bonding curve vía PumpPriceReaderRaw
    * - Si no existe curva o está graduado → usa Jupiter
-   * - Si Jupiter falla → intenta DexScreener (requiere que token tenga actividad)
+   * - Si Jupiter falla → intenta DexScreener
    */
   async getPrice(mintStr, { forceFresh = false } = {}) {
     const mint = new PublicKey(mintStr);
@@ -57,7 +62,7 @@ class PriceService {
     // Verificar intentos fallidos recientes
     if (!forceFresh && this.failedAttempts.has(cacheKey)) {
       const failed = this.failedAttempts.get(cacheKey);
-      
+
       // Reset si ha pasado suficiente tiempo
       if (now - failed.lastAttempt > this.failedAttemptsResetMs) {
         this.failedAttempts.delete(cacheKey);
@@ -65,11 +70,24 @@ class PriceService {
         // Demasiados intentos fallidos, usar cache o devolver null
         if (this.priceCache.has(cacheKey)) {
           const cached = this.priceCache.get(cacheKey);
-          console.log(`   ℹ️ Using stale cache for ${cacheKey.slice(0, 8)}... (too many failures)`);
+          console.log(
+            `   ℹ️ Using stale cache for ${cacheKey.slice(
+              0,
+              8,
+            )}... (too many failures)`,
+          );
           return cached;
         }
-        
-        console.log(`   ⏭️ Skipping price check for ${cacheKey.slice(0, 8)}... (too many failures, retry in ${Math.floor((this.failedAttemptsResetMs - (now - failed.lastAttempt))/1000)}s)`);
+
+        console.log(
+          `   ⏭️ Skipping price check for ${cacheKey.slice(
+            0,
+            8,
+          )}... (too many failures, retry in ${Math.floor(
+            (this.failedAttemptsResetMs - (now - failed.lastAttempt)) /
+              1000,
+          )}s)`,
+        );
         return {
           mint: cacheKey,
           price: null,
@@ -88,14 +106,14 @@ class PriceService {
       }
     }
 
-    // 1) Intentar Pump.fun bonding curve
+    // 1) Intentar Pump.fun bonding curve vía RAW RPC
     try {
-      const pump = await this.getPumpFunPrice(mint);
+      const pump = await this.getPumpFunPrice(cacheKey);
       if (pump && pump.price && !pump.graduated) {
         const result = {
           mint: cacheKey,
           price: pump.price,
-          source: 'pump.fun',
+          source: 'pump.fun_raw',
           bondingProgress: pump.bondingProgress,
           graduated: false,
           ts: now,
@@ -107,9 +125,14 @@ class PriceService {
 
       // Si la curva marca "complete" o no existe → considerar graduado
       if (pump && pump.graduated) {
-        console.log(`   🎓 ${cacheKey.slice(0, 8)}... marked as graduated by bonding curve`);
+        console.log(
+          `   🎓 ${cacheKey.slice(
+            0,
+            8,
+          )}... marked as graduated by PumpPriceReaderRaw`,
+        );
       }
-    } catch (err) {
+    } catch (_err) {
       // Ignoramos errores de bonding curve para no ensuciar logs
     }
 
@@ -147,14 +170,18 @@ class PriceService {
 
     // ❌ Todos los métodos fallaron
     this.recordFailedAttempt(cacheKey);
-    
+
     // Usar cache antiguo si existe
     if (this.priceCache.has(cacheKey)) {
       const cached = this.priceCache.get(cacheKey);
-      console.log(`   ⚠️ All price sources failed, using stale cache (${Math.floor((now - cached.ts)/1000)}s old)`);
+      console.log(
+        `   ⚠️ All price sources failed, using stale cache (${Math.floor(
+          (now - cached.ts) / 1000,
+        )}s old)`,
+      );
       return {
         ...cached,
-        stale: true
+        stale: true,
       };
     }
 
@@ -183,96 +210,46 @@ class PriceService {
       }
       return { price: null, source: 'jupiter', error: jup?.error };
     } catch (err) {
-      // Solo log en caso de error inesperado
-      if (!err.message.includes('Route not found') && !err.message.includes('404')) {
-        console.error(`   ❌ Jupiter getPriceForGraduated error: ${err.message}`);
+      if (
+        !err.message.includes('Route not found') &&
+        !err.message.includes('404')
+      ) {
+        console.error(
+          `   ❌ Jupiter getPriceForGraduated error: ${err.message}`,
+        );
       }
       return { price: null, source: 'jupiter', error: err.message };
     }
   }
 
   // ------------------------------------------------------------------
-  // 🧮 Pump.fun bonding curve
+  // 🧮 Pump.fun bonding curve (delegado a PumpPriceReaderRaw)
   // ------------------------------------------------------------------
 
   /**
-   * Derivar PDA de la bonding curve
+   * Usar PumpPriceReaderRaw para leer la bonding curve y adaptar el resultado
+   * a lo que espera getPrice()
    */
-  findBondingCurveAddress(tokenMint) {
-    const [curveAddress] = PublicKey.findProgramAddressSync(
-      [PUMP_CURVE_SEED, tokenMint.toBuffer()],
-      PUMP_PROGRAM_ID
-    );
-    return curveAddress;
-  }
+  async getPumpFunPrice(mintStr) {
+    const raw = await this.pumpRaw.getPrice(mintStr);
+    if (!raw) return null;
 
-  /**
-   * Leer el estado de la bonding curve + calcular precio + progreso
-   */
-  async getPumpFunPrice(tokenMint) {
-    const curveAddress = this.findBondingCurveAddress(tokenMint);
-
-    try {
-      const accountInfo = await this.connection.getAccountInfo(curveAddress);
-      
-      if (!accountInfo || !accountInfo.data) {
-        // ✅ Silencio: Devolvemos null en lugar de lanzar Error
-        return null;
-      }
-
-      const data = accountInfo.data;
-
-      // Opcional: verificar signature (primeros 8 bytes)
-      const expectedSig = Buffer.from([0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60]);
-      const actualSig = data.subarray(0, 8);
-      if (!actualSig.equals(expectedSig)) {
-        console.warn('   ⚠️ Bonding curve account signature mismatch (IDL discriminator)');
-      }
-
-      // Layout según el IDL
-      const virtualTokenReserves = data.readBigUInt64LE(0x08);
-      const virtualSolReserves = data.readBigUInt64LE(0x10);
-      const realTokenReserves = data.readBigUInt64LE(0x18);
-      const realSolReserves = data.readBigUInt64LE(0x20);
-      const tokenTotalSupply = data.readBigUInt64LE(0x28);
-      const complete = data.readUInt8(0x30) !== 0;
-
-      if (virtualTokenReserves <= 0n || virtualSolReserves <= 0n) {
-        throw new Error('Invalid bonding curve state (zero reserves)');
-      }
-
-      const virtualSol = Number(virtualSolReserves) / LAMPORTS_PER_SOL;
-      const virtualTokens = Number(virtualTokenReserves) / 10 ** PUMP_TOKEN_DECIMALS;
-
-      const price = virtualSol / virtualTokens;
-
-      // Progreso de bonding
-      const INITIAL_REAL_TOKEN_RESERVES = 793100000000000n;
-      let bondingProgress = 0;
-      if (realTokenReserves < INITIAL_REAL_TOKEN_RESERVES) {
-        bondingProgress =
-          1 -
-          Number((realTokenReserves * 10000n) / INITIAL_REAL_TOKEN_RESERVES) /
-            10000;
-      }
-
-      return {
-        price,
-        curveState: {
-          virtualTokenReserves: virtualTokenReserves.toString(),
-          virtualSolReserves: virtualSolReserves.toString(),
-          realTokenReserves: realTokenReserves.toString(),
-          realSolReserves: realSolReserves.toString(),
-          tokenTotalSupply: tokenTotalSupply.toString(),
-          complete,
-        },
-        bondingProgress,
-        graduated: complete,
-      };
-    } catch (e) {
-      // Cualquier otro error de red o parseo devuelve null suavemente
-      return null;
-    }
+    return {
+      price: raw.price,
+      // Adaptación opcional por si quieres loguear reservas
+      curveState: raw.reserves
+        ? {
+            virtualTokenReserves: raw.reserves.virtualTokenReserves,
+            virtualSolReserves: raw.reserves.virtualSolReserves,
+            realTokenReserves: raw.reserves.realTokenReserves,
+            realSolReserves: raw.reserves.realSolReserves,
+            tokenTotalSupply: raw.reserves.tokenTotalSupply,
+            complete: raw.graduated,
+          }
+        : null,
+      bondingProgress: raw.bondingProgress,
+      graduated: raw.graduated,
+    };
   }
 
   // ------------------------------------------------------------------
@@ -281,11 +258,11 @@ class PriceService {
   async getPriceFromDexScreener(mintStr) {
     try {
       const url = `${DEXSCREENER_URL}/${mintStr}`;
-      const res = await fetch(url, { 
+      const res = await fetch(url, {
         timeout: 5000,
         headers: {
-          'User-Agent': 'Mozilla/5.0'
-        }
+          'User-Agent': 'Mozilla/5.0',
+        },
       });
 
       if (!res.ok) {
@@ -295,21 +272,25 @@ class PriceService {
         }
         throw new Error(`DexScreener HTTP ${res.status}`);
       }
-      
+
       const data = await res.json();
-      
+
       if (!data.pairs || !data.pairs.length) {
-        // ✅ Mejorado: No lanzar error, devolver null con mensaje informativo
-        console.log(`   ℹ️ ${mintStr.slice(0, 8)}... not on DexScreener (needs first trade)`);
-        return { 
-          price: null, 
-          error: 'No pairs - token needs trading activity to be listed' 
+        console.log(
+          `   ℹ️ ${mintStr.slice(
+            0,
+            8,
+          )}... not on DexScreener (needs first trade)`,
+        );
+        return {
+          price: null,
+          error: 'No pairs - token needs trading activity to be listed',
         };
       }
 
       // Tomar el par con más liquidez
       const best = data.pairs.sort(
-        (a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0)
+        (a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0),
       )[0];
 
       const price = Number(best.priceNative || best.priceUsd || 0);
@@ -318,14 +299,18 @@ class PriceService {
       }
 
       console.log(
-        `   📊 DexScreener price for ${mintStr.slice(0, 8)}...: ${price} (source: ${best.dexId})`
+        `   📊 DexScreener price for ${mintStr.slice(
+          0,
+          8,
+        )}...: ${price} (source: ${best.dexId})`,
       );
 
       return { price, source: 'dexscreener' };
     } catch (err) {
-      // ✅ Solo log de warnings, no errores
       if (!err.message.includes('No pairs')) {
-        console.warn(`   ⚠️ DexScreener unavailable: ${err.message.split('\n')[0]}`);
+        console.warn(
+          `   ⚠️ DexScreener unavailable: ${err.message.split('\n')[0]}`,
+        );
       }
       return { price: null, error: err.message };
     }
@@ -334,17 +319,18 @@ class PriceService {
   // ------------------------------------------------------------------
   // Gestión de intentos fallidos
   // ------------------------------------------------------------------
-  
+
   recordFailedAttempt(mintStr) {
     const now = Date.now();
-    const current = this.failedAttempts.get(mintStr) || { count: 0, lastAttempt: 0 };
-    
+    const current =
+      this.failedAttempts.get(mintStr) || { count: 0, lastAttempt: 0 };
+
     this.failedAttempts.set(mintStr, {
       count: current.count + 1,
-      lastAttempt: now
+      lastAttempt: now,
     });
   }
-  
+
   resetFailedAttempts(mintStr) {
     this.failedAttempts.delete(mintStr);
   }
@@ -357,12 +343,11 @@ class PriceService {
    * Calcular valor actual (en SOL) dada una posición y el precio
    */
   calculateCurrentValue(tokensAmount, price) {
-    const amount = typeof tokensAmount === 'number'
-      ? tokensAmount
-      : Number(tokensAmount);
+    const amount =
+      typeof tokensAmount === 'number' ? tokensAmount : Number(tokensAmount);
     return amount * price;
   }
-  
+
   /**
    * Verificar si un token tiene precio disponible
    */
@@ -370,7 +355,7 @@ class PriceService {
     const priceData = await this.getPrice(mintStr);
     return !!(priceData && priceData.price && priceData.source !== 'none');
   }
-  
+
   /**
    * Limpiar cache (útil para testing o cuando se necesita forzar refresh)
    */
