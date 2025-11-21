@@ -483,12 +483,18 @@ async function monitorOpenPositions() {
         const exitDecision = await copyStrategy.shouldExit(position, currentPrice);
 
         if (exitDecision.exit) {
+          // ✅ CORRECCIÓN 1: Mostrar el PnL correcto de la estrategia
+          const displayPnL = exitDecision.pnl !== undefined ? exitDecision.pnl : pnlPercent;
+
           console.log(`\n🚪 EXIT SIGNAL: ${exitDecision.reason.toUpperCase()}`);
           console.log(`   ${exitDecision.description}`);
-          console.log(`   PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}% (${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(4)} SOL)`);
+          console.log(`   PnL Strategy: ${displayPnL >= 0 ? '+' : ''}${displayPnL.toFixed(2)}%`);
           console.log(`   Priority: ${exitDecision.priority || 'N/A'}\n`);
 
           await executeSell(position, currentPrice, currentSolValue, exitDecision.reason);
+          
+          // ✅ CORRECCIÓN 2: Pausa de seguridad para evitar spam de logs si falla
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
       }
 
