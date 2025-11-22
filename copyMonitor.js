@@ -333,11 +333,8 @@ async function processCopySignals() {
             exitStrategy: 'hybrid_smart_exit',
           });
 
-          await redis.setex(
-            `copy_cooldown:${copySignal.mint}`,
-            60,
-            '1',
-          );
+          // 🔥 Cooldown POR MINT eliminado: ahora el bot puede recomprar
+          // el mismo token si copyStrategy lo permite, sin bloqueo extra.
 
           if (process.env.TELEGRAM_OWNER_CHAT_ID) {
             try {
@@ -503,7 +500,7 @@ async function emergencyExit(position, currentPrice, approxSolValue) {
     // Delay opcional para Jupiter tras graduación
     let useJupiter = isGraduatedFlag;
     const gradTimeStr = position.graduationTime;
-    const gradDelaySec = Number(
+       const gradDelaySec = Number(
       process.env.JUPITER_GRAD_DELAY_SEC || '0',
     );
 
@@ -1112,10 +1109,12 @@ async function sendPnLUpdate(
         `Max: $${maxPrice.toFixed(10)}\n` +
         `\n` +
         `💰 PnL: ${
-          pnlPercent >= 0 ? '+' : ''
+          pnlPercent >= 0 ? '+'
+            : ''
         }${pnlPercent.toFixed(2)}% ` +
         `(${
-          pnlSOL >= 0 ? '+' : ''
+          pnlSOL >= 0 ? '+'
+            : ''
         }${pnlSOL.toFixed(4)} SOL)\n` +
         `⏱️ Hold: ${holdTime}s\n` +
         `🎯 Upvotes: ${upvotes}\n` +
