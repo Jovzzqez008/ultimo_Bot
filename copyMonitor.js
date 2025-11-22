@@ -25,6 +25,30 @@ const ENABLE_TRADING = process.env.ENABLE_AUTO_TRADING === 'true';
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 const LIVE_UPDATES = process.env.TELEGRAM_LIVE_UPDATES !== 'false';
 
+// ⚙️ Configuración adaptativa desde variables de entorno
+const ADAPTIVE_BUY_ENABLED = process.env.ADAPTIVE_BUY_ENABLED !== 'false';
+const ADAPTIVE_SELL_ENABLED = process.env.ADAPTIVE_SELL_ENABLED !== 'false';
+
+function parseEnvNumber(name, defaultValue) {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : defaultValue;
+}
+
+const BUY_MAX_RETRIES = parseEnvNumber('BUY_MAX_RETRIES', 1);
+const SELL_MAX_RETRIES = parseEnvNumber('SELL_MAX_RETRIES', 1);
+
+const BUY_SLIPPAGE_STEP = parseEnvNumber('BUY_SLIPPAGE_STEP', 5);
+const SELL_SLIPPAGE_STEP = parseEnvNumber('SELL_SLIPPAGE_STEP', 5);
+const BUY_MAX_SLIPPAGE = parseEnvNumber('BUY_MAX_SLIPPAGE', 40);
+const SELL_MAX_SLIPPAGE = parseEnvNumber('SELL_MAX_SLIPPAGE', 40);
+
+const BUY_PRIORITY_STEP = parseEnvNumber('BUY_PRIORITY_STEP', 0.00025);
+const SELL_PRIORITY_STEP = parseEnvNumber('SELL_PRIORITY_STEP', 0.00025);
+const BUY_MAX_PRIORITY_FEE = parseEnvNumber('BUY_MAX_PRIORITY_FEE', 0.002);
+const SELL_MAX_PRIORITY_FEE = parseEnvNumber('SELL_MAX_PRIORITY_FEE', 0.002);
+
 // 🎯 HYBRID STRATEGY CONFIG
 const WALLET_EXIT_WINDOW = 180000; // 3 minutes
 const LOSS_PROTECTION_WINDOW = 600000; // 10 minutes
@@ -110,6 +134,106 @@ async function getWalletTokenBalance(mint) {
     );
     return 0;
   }
+}
+
+// 🔁 BUY adaptativo con PumpPortal (slippage y priority fee crecientes)
+async function adaptivePumpPortalBuy(mint, solAmount) {
+  const baseSlippage = Number(process.env.COPY_SLIPPAGE || '10');
+  const basePriorityFee = Number(process.env.PRIORITY_FEE || '0.0005');
+
+  if (!pumpPortal) {
+    throw new Error('PumpPortal executor not initialized');
+  }
+
+  // Si está desactivado o sin reintentos -> comportamiento viejo
+  if (!ADAPTIVE_BUY_ENABLED || BUY_MAX_RETRIES <= 0) {
+    return pumpPortal.buyToken(mint, solAmount, baseSlippage, basePriorityFee);
+  }
+
+  let slippage = baseSlippage;
+  let priorityFee = basePriorityFee;
+  let lastResult = null;
+
+  for (let attempt = 0; attempt <= BUY_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      console.log(
+        `   🔁 Retrying BUY (attempt ${attempt + 1}/${BUY_MAX_RETRIES + 1})` +
+          ` slippage=${slippage}% priority=${priorityFee} SOL`,
+      );
+    }
+
+    const result = await pumpPortal.buyToken(mint, solAmount, slippage, priorityFee);
+    lastResult = result;
+
+    if (result.success) {
+      return result;
+    }
+
+    const msg = (result.error || '').toLowerCase();
+    if (msg.includes('insufficient lamports') || msg.includes('insufficient funds')) {
+      console.log('   🚫 Stopping BUY retries: insufficient SOL in wallet');
+      break;
+    }
+
+    if (attempt === BUY_MAX_RETRIES) break;
+
+    slippage = Math.min(slippage + BUY_SLIPPAGE_STEP, BUY_MAX_SLIPPAGE);
+    priorityFee = Math.min(priorityFee + BUY_PRIORITY_STEP, BUY_MAX_PRIORITY_FEE);
+  }
+
+  return lastResult;
+}
+
+// 🔁 SELL adaptativo con PumpPortal (slippage y priority fee crecientes)
+async function adaptivePumpPortalSell(mint, tokensAmountUi) {
+  const baseSlippage = Number(process.env.COPY_SLIPPAGE || '10');
+  const basePriorityFee = Number(process.env.PRIORITY_FEE || '0.0005');
+
+  if (!pumpPortal) {
+    throw new Error('PumpPortal executor not initialized');
+  }
+
+  if (!ADAPTIVE_SELL_ENABLED || SELL_MAX_RETRIES <= 0) {
+    return pumpPortal.sellToken(mint, tokensAmountUi, baseSlippage, basePriorityFee);
+  }
+
+  let slippage = baseSlippage;
+  let priorityFee = basePriorityFee;
+  let lastResult = null;
+
+  for (let attempt = 0; attempt <= SELL_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      console.log(
+        `   🔁 Retrying SELL (attempt ${attempt + 1}/${SELL_MAX_RETRIES + 1})` +
+          ` slippage=${slippage}% priority=${priorityFee} SOL`,
+      );
+    }
+
+    const result = await pumpPortal.sellToken(
+      mint,
+      tokensAmountUi,
+      slippage,
+      priorityFee,
+    );
+    lastResult = result;
+
+    if (result.success) {
+      return result;
+    }
+
+    const msg = (result.error || '').toLowerCase();
+    if (msg.includes('insufficient lamports') || msg.includes('insufficient funds')) {
+      console.log('   🚫 Stopping SELL retries: insufficient SOL to pay fees');
+      break;
+    }
+
+    if (attempt === SELL_MAX_RETRIES) break;
+
+    slippage = Math.min(slippage + SELL_SLIPPAGE_STEP, SELL_MAX_SLIPPAGE);
+    priorityFee = Math.min(priorityFee + SELL_PRIORITY_STEP, SELL_MAX_PRIORITY_FEE);
+  }
+
+  return lastResult;
 }
 
 // Obtiene precio actual + valor en SOL usando PriceService (Pump.fun + Jupiter)
@@ -325,101 +449,116 @@ async function processCopySignals() {
       console.log(`   📊 Amount: ${decision.amount.toFixed(4)} SOL`);
 
       if (ENABLE_TRADING && pumpPortal && positionManager) {
-        const buyResult = await pumpPortal.buyToken(
+        let buyResult;
+
+        if (DRY_RUN) {
+          // PAPER: simulamos tokens recibidos teóricos
+          const theoreticalTokens =
+            currentPrice > 0 ? decision.amount / currentPrice : 0;
+          buyResult = {
+            success: true,
+            signature: 'DRY_RUN',
+            tokensReceived: theoreticalTokens,
+          };
+        } else {
+          // 🔁 BUY real con reintentos adaptativos
+          buyResult = await adaptivePumpPortalBuy(
+            copySignal.mint,
+            decision.amount,
+          );
+        }
+
+        if (!buyResult || !buyResult.success) {
+          console.log(
+            `❌ BUY FAILED${
+              buyResult && buyResult.error ? `: ${buyResult.error}` : ''
+            }\n`,
+          );
+          continue;
+        }
+
+        const mode = DRY_RUN ? '📄 PAPER' : '💰 LIVE';
+        const executedDex = 'Pump.fun (PumpPortal Local API - 1.75%)';
+
+        const tokensReceived =
+          buyResult.tokensReceived ||
+          (currentPrice > 0 ? decision.amount / currentPrice : 0);
+
+        console.log(`${mode} BUY EXECUTED via PumpPortal`);
+        console.log(`   Tokens: ${tokensReceived}`);
+        console.log(`   Signature: ${buyResult.signature}\n`);
+
+        await positionManager.openPosition(
           copySignal.mint,
+          'COPY',
+          currentPrice,
           decision.amount,
-          Number(process.env.COPY_SLIPPAGE || '10'),
-          Number(process.env.PRIORITY_FEE || '0.0005'),
+          tokensReceived,
+          buyResult.signature,
         );
 
-        if (buyResult.success) {
-          const mode = DRY_RUN ? '📄 PAPER' : '💰 LIVE';
-          const executedDex =
-            'Pump.fun (PumpPortal Local API - 1.75%)';
+        await redis.hset(`position:${copySignal.mint}`, {
+          strategy: 'copy',
+          walletSource: copySignal.walletAddress,
+          walletName: copySignal.walletName,
+          upvotes: decision.upvotes.toString(),
+          buyers: JSON.stringify(decision.buyers),
+          originalSignature: copySignal.signature,
+          originalDex: copySignal.dex,
+          executedDex: executedDex,
+          confidence: decision.confidence.toString(),
+          exitStrategy: 'hybrid_smart_exit',
+        });
 
-          console.log(`${mode} BUY EXECUTED via PumpPortal`);
-          console.log(`   Tokens: ${buyResult.tokensReceived}`);
-          console.log(`   Signature: ${buyResult.signature}\n`);
+        // ❌ Sin cooldown por mint: puede recomprar si la estrategia lo permite
 
-          await positionManager.openPosition(
-            copySignal.mint,
-            'COPY',
-            currentPrice,
-            decision.amount,
-            buyResult.tokensReceived,
-            buyResult.signature,
-          );
+        if (process.env.TELEGRAM_OWNER_CHAT_ID) {
+          try {
+            const confidenceEmoji =
+              decision.confidence >= 80
+                ? '🔥'
+                : decision.confidence >= 60
+                ? '🟢'
+                : '🟡';
 
-          await redis.hset(`position:${copySignal.mint}`, {
-            strategy: 'copy',
-            walletSource: copySignal.walletAddress,
-            walletName: copySignal.walletName,
-            upvotes: decision.upvotes.toString(),
-            buyers: JSON.stringify(decision.buyers),
-            originalSignature: copySignal.signature,
-            originalDex: copySignal.dex,
-            executedDex: executedDex,
-            confidence: decision.confidence.toString(),
-            exitStrategy: 'hybrid_smart_exit',
-          });
-
-          // ❌ Sin cooldown por mint: puede recomprar si la estrategia lo permite
-
-          if (process.env.TELEGRAM_OWNER_CHAT_ID) {
-            try {
-              const confidenceEmoji =
-                decision.confidence >= 80
-                  ? '🔥'
-                  : decision.confidence >= 60
-                  ? '🟢'
-                  : '🟡';
-
-              await sendTelegramAlert(
-                process.env.TELEGRAM_OWNER_CHAT_ID,
-                `${confidenceEmoji} SMART COPY BUY\n\n` +
-                  `Trader: ${copySignal.walletName}\n` +
-                  `Token: ${copySignal.mint.slice(0, 16)}...\n` +
-                  `\n` +
-                  `🚀 Bought via: ${executedDex}\n` +
-                  `${
-                    copySignal.dex
-                      ? `Original DEX: ${copySignal.dex}\n`
-                      : ''
-                  }` +
-                  `Price: $${currentPrice.toFixed(10)}\n` +
-                  `Amount: ${decision.amount.toFixed(4)} SOL\n` +
-                  `\n` +
-                  `Upvotes: ${decision.upvotes} wallet(s)\n` +
-                  `Confidence: ${decision.confidence}%\n` +
-                  `\n` +
-                  `🎯 HYBRID Exit Strategy:\n` +
-                  `• 0-3 min: Copy wallet exits\n` +
-                  `• 3-10 min: Copy only on loss\n` +
-                  `• 10+ min: Independent trading\n` +
-                  `• Take Profit: +${
-                    process.env.COPY_PROFIT_TARGET || 200
-                  }%\n` +
-                  `• Trailing Stop: -${
-                    process.env.TRAILING_STOP || 35
-                  }%\n` +
-                  `• Stop Loss: -${
-                    process.env.COPY_STOP_LOSS || 25
-                  }%`,
-                false,
-              );
-            } catch (e) {
-              console.log('⚠️ Telegram notification failed');
-            }
+            await sendTelegramAlert(
+              process.env.TELEGRAM_OWNER_CHAT_ID,
+              `${confidenceEmoji} SMART COPY BUY\n\n` +
+                `Trader: ${copySignal.walletName}\n` +
+                `Token: ${copySignal.mint.slice(0, 16)}...\n` +
+                `\n` +
+                `🚀 Bought via: ${executedDex}\n` +
+                `${
+                  copySignal.dex ? `Original DEX: ${copySignal.dex}\n` : ''
+                }` +
+                `Price: $${currentPrice.toFixed(10)}\n` +
+                `Amount: ${decision.amount.toFixed(4)} SOL\n` +
+                `\n` +
+                `Upvotes: ${decision.upvotes} wallet(s)\n` +
+                `Confidence: ${decision.confidence}%\n` +
+                `\n` +
+                `🎯 HYBRID Exit Strategy:\n` +
+                `• 0-3 min: Copy wallet exits\n` +
+                `• 3-10 min: Copy only on loss\n` +
+                `• 10+ min: Independent trading\n` +
+                `• Take Profit: +${
+                  process.env.COPY_PROFIT_TARGET || 200
+                }%\n` +
+                `• Trailing Stop: -${
+                  process.env.TRAILING_STOP || 35
+                }%\n` +
+                `• Stop Loss: -${
+                  process.env.COPY_STOP_LOSS || 25
+                }%`,
+              false,
+            );
+          } catch (e) {
+            console.log('⚠️ Telegram notification failed');
           }
-        } else {
-          console.log(`❌ BUY FAILED: ${buyResult.error}\n`);
         }
       }
     } catch (error) {
-      console.error(
-        '❌ Error processing copy signal:',
-        error.message,
-      );
+      console.error('❌ Error processing copy signal:', error.message);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
@@ -438,15 +577,10 @@ async function processSellSignals() {
       const sellSignal = JSON.parse(signalJson);
       const { mint, sellCount } = sellSignal;
 
-      console.log(
-        `\n📉 Processing sell signal for ${mint.slice(0, 8)}...`,
-      );
+      console.log(`\n📉 Processing sell signal for ${mint.slice(0, 8)}...`);
       console.log(`   Sellers: ${sellCount}`);
 
-      const hasPosition = await redis.sismember(
-        'open_positions',
-        mint,
-      );
+      const hasPosition = await redis.sismember('open_positions', mint);
 
       if (!hasPosition) {
         console.log(`   ⭕️ No position in this token\n`);
@@ -459,9 +593,7 @@ async function processSellSignals() {
         continue;
       }
 
-      const minToSell = parseInt(
-        process.env.MIN_WALLETS_TO_SELL || '1',
-      );
+      const minToSell = parseInt(process.env.MIN_WALLETS_TO_SELL || '1');
 
       if (sellCount >= minToSell) {
         console.log(
@@ -493,10 +625,7 @@ async function processSellSignals() {
         );
       }
     } catch (error) {
-      console.error(
-        '❌ Error processing sell signal:',
-        error.message,
-      );
+      console.error('❌ Error processing sell signal:', error.message);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
@@ -531,9 +660,7 @@ async function emergencyExit(position, currentPrice, approxSolValue) {
     // Delay opcional para Jupiter tras graduación
     let useJupiter = isGraduatedFlag;
     const gradTimeStr = position.graduationTime;
-    const gradDelaySec = Number(
-      process.env.JUPITER_GRAD_DELAY_SEC || '0',
-    );
+    const gradDelaySec = Number(process.env.JUPITER_GRAD_DELAY_SEC || '0');
 
     if (useJupiter && gradTimeStr && gradDelaySec > 0) {
       const gradTime = parseInt(gradTimeStr);
@@ -554,12 +681,10 @@ async function emergencyExit(position, currentPrice, approxSolValue) {
     let executorLabel;
 
     if (!useJupiter) {
-      // VENDER en Pump.fun via PumpPortal (internamente "100%")
-      sellResult = await pumpPortal.sellToken(
+      // VENDER en Pump.fun via PumpPortal (adaptativo)
+      sellResult = await adaptivePumpPortalSell(
         mint,
         tokensAmountUi,
-        Number(process.env.COPY_SLIPPAGE || '10'),
-        Number(process.env.PRIORITY_FEE || '0.0005'),
       );
       executorLabel = 'Pump.fun (PumpPortal Local API - 1.75%)';
     } else {
@@ -581,31 +706,40 @@ async function emergencyExit(position, currentPrice, approxSolValue) {
 
       if (routeError) {
         console.log(
-          '\n⚠️ [EMERGENCY EXIT] Jupiter failed, falling back to PumpPortal.',
+          '\n⚠️ [EMERGENCY EXIT] Jupiter failed, falling back to PumpPortal (adaptive).',
         );
-        sellResult = await pumpPortal.sellToken(
+        sellResult = await adaptivePumpPortalSell(
           mint,
           tokensAmountUi,
-          Number(process.env.COPY_SLIPPAGE || '10'),
-          Number(process.env.PRIORITY_FEE || '0.0005'),
         );
         executorLabel = 'Pump.fun (PumpPortal Local API - 1.75%)';
       }
     }
 
-    if (!sellResult.success) {
+    if (!sellResult || !sellResult.success) {
       console.log(
         `❌ [EMERGENCY EXIT] SELL FAILED for ${mint.slice(
           0,
           8,
-        )}...: ${sellResult.error}`,
+        )}...: ${sellResult && sellResult.error ? sellResult.error : 'unknown'}`,
+      );
+      return;
+    }
+
+    const solReceived =
+      sellResult.solReceived ?? sellResult.expectedSOL ?? 0;
+
+    if (!solReceived || solReceived <= 0) {
+      console.log(
+        `❌ [EMERGENCY EXIT] No SOL received on-chain for ${mint.slice(
+          0,
+          8,
+        )}... keeping position OPEN.`,
       );
       return;
     }
 
     const mode = DRY_RUN ? '📄 PAPER' : '💰 LIVE';
-    const solReceived =
-      sellResult.solReceived ?? sellResult.expectedSOL ?? 0;
 
     console.log(
       `${mode} [EMERGENCY EXIT] SOLD ${tokensAmountUi} tokens of ${mint.slice(
@@ -707,19 +841,14 @@ async function monitorOpenPositions() {
         }
 
         const currentPrice = valueData.marketPrice;
-        const executor = valueData.graduated
-          ? 'jupiter'
-          : 'pumpportal';
+        const executor = valueData.graduated ? 'jupiter' : 'pumpportal';
 
         // 🔎 VALIDAR CAMPOS ANTES DE CALCULAR PnL
         const entryPriceNum = Number(position.entryPrice);
         const solSpentNum = Number(position.solAmount || position.solSpent);
 
         const hasMissingFields =
-          !entryPriceNum ||
-          !solSpentNum ||
-          !tokensAmount ||
-          !currentPrice;
+          !entryPriceNum || !solSpentNum || !tokensAmount || !currentPrice;
 
         if (hasMissingFields) {
           console.log(
@@ -740,9 +869,7 @@ async function monitorOpenPositions() {
             executor: executor,
             estimatedSlippage: 0.02, // 2% estimado
             networkFee: 0.000005,
-            priorityFee: Number(
-              process.env.PRIORITY_FEE || '0.0005',
-            ),
+            priorityFee: Number(process.env.PRIORITY_FEE || '0.0005'),
           },
         );
 
@@ -784,24 +911,18 @@ async function monitorOpenPositions() {
         }
 
         // Force exit por graduación
-        const forceExit = await redis.get(
-          `force_exit:${position.mint}`,
-        );
+        const forceExit = await redis.get(`force_exit:${position.mint}`);
         if (forceExit) {
           await redis.del(`force_exit:${position.mint}`);
 
           console.log(`\n🎓 FORCE EXIT: Graduation detected`);
           console.log(`   Reason: ${forceExit}`);
           console.log(
-            `   PnL: ${
-              pnlPercent >= 0 ? '+' : ''
-            }${pnlPercent.toFixed(2)}% (${
-              pnlSOL >= 0 ? '+' : ''
-            }${pnlSOL.toFixed(4)} SOL)`,
+            `   PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(
+              2,
+            )}% (${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(4)} SOL)`,
           );
-          console.log(
-            `   Priority: 1 (Graduation override)\n`,
-          );
+          console.log(`   Priority: 1 (Graduation override)\n`);
 
           await executeSell(
             position,
@@ -827,15 +948,11 @@ async function monitorOpenPositions() {
           console.log(`   ${hybridExit.description}`);
           console.log(`   Phase: ${hybridExit.phase}`);
           console.log(
-            `   PnL: ${
-              pnlPercent >= 0 ? '+' : ''
-            }${pnlPercent.toFixed(2)}% (${
-              pnlSOL >= 0 ? '+' : ''
-            }${pnlSOL.toFixed(4)} SOL)`,
+            `   PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(
+              2,
+            )}% (${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(4)} SOL)`,
           );
-          console.log(
-            `   Priority: ${hybridExit.priority}\n`,
-          );
+          console.log(`   Priority: ${hybridExit.priority}\n`);
 
           await executeSell(
             position,
@@ -878,18 +995,13 @@ async function monitorOpenPositions() {
             exitDecision.reason,
           );
 
-          await new Promise((resolve) =>
-            setTimeout(resolve, 5000),
-          );
+          await new Promise((resolve) => setTimeout(resolve, 5000));
         }
       }
 
       await new Promise((resolve) => setTimeout(resolve, 2000));
     } catch (error) {
-      console.error(
-        '❌ Error monitoring positions:',
-        error.message,
-      );
+      console.error('❌ Error monitoring positions:', error.message);
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
   }
@@ -948,12 +1060,10 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
     let executorLabel;
 
     if (!useJupiter) {
-      // ✅ VENTA EN PUMP.FUN via PumpPortal Local API (100% interno)
-      sellResult = await pumpPortal.sellToken(
+      // ✅ VENTA EN PUMP.FUN via PumpPortal Local API (100% interno, adaptativo)
+      sellResult = await adaptivePumpPortalSell(
         mint,
         tokensAmountUi,
-        Number(process.env.COPY_SLIPPAGE || '10'),
-        Number(process.env.PRIORITY_FEE || '0.0005'),
       );
       executor = 'pumpportal';
       executorLabel = 'Pump.fun (PumpPortal Local API - 1.75%)';
@@ -967,7 +1077,7 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
       executor = 'jupiter';
       executorLabel = 'Jupiter Ultra Swap (~0.3%)';
 
-      // 🔁 FALLBACK: si Jupiter falla por falta de ruta / error 0x1789, volver a PumpPortal
+      // 🔁 FALLBACK: si Jupiter falla por falta de ruta / error 0x1789, volver a PumpPortal (adaptativo)
       const errorMsg = sellResult && sellResult.error ? sellResult.error : '';
       const routeError =
         !sellResult.success &&
@@ -978,14 +1088,12 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
 
       if (routeError) {
         console.log(
-          '\n⚠️ Jupiter route not ready / simulation failed. Falling back to PumpPortal for this sell.',
+          '\n⚠️ Jupiter route not ready / simulation failed. Falling back to PumpPortal (adaptive) for this sell.',
         );
 
-        sellResult = await pumpPortal.sellToken(
+        sellResult = await adaptivePumpPortalSell(
           mint,
           tokensAmountUi,
-          Number(process.env.COPY_SLIPPAGE || '10'),
-          Number(process.env.PRIORITY_FEE || '0.0005'),
         );
 
         executor = 'pumpportal';
@@ -993,98 +1101,111 @@ async function executeSell(position, currentPrice, _currentSolValue, reason) {
       }
     }
 
-    if (sellResult.success) {
-      const mode = DRY_RUN ? '📄 PAPER' : '💰 LIVE';
-      const solReceived =
-        sellResult.solReceived ?? sellResult.expectedSOL ?? 0;
-
-      console.log(`${mode} SELL EXECUTED via ${executorLabel}`);
-      console.log(`   SOL received: ${solReceived}`);
-      console.log(`   Signature: ${sellResult.signature}\n`);
-
-      // ✅ CALCULAR PnL CORRECTO CON FEES REALES
-      const pnlData = PnLCalculator.calculatePnL({
-        entryPrice: parseFloat(position.entryPrice),
-        exitPrice: exitPrice,
-        tokenAmount: tokensAmountUi,
-        solSpent: parseFloat(position.solAmount),
-        executor: executor,
-        slippage: 0, // En producción, calcular del resultado real
-        networkFee: 0.000005,
-        priorityFee: Number(process.env.PRIORITY_FEE || '0.0005'),
-      });
-
-      // Verificar discrepancias (útil para debug)
-      PnLCalculator.checkDiscrepancy({
-        entryPrice: parseFloat(position.entryPrice),
-        exitPrice: exitPrice,
-        tokenAmount: tokensAmountUi,
-        solSpent: parseFloat(position.solAmount),
-        executor: executor,
-      });
-
-      // Cerrar posición con PnL correcto
-      const closedPosition = await positionManager.closePosition(
-        mint,
-        exitPrice,
-        tokensAmountUi,
-        pnlData.netReceived, // Usar el valor neto calculado
-        reason,
-        sellResult.signature,
+    if (!sellResult || !sellResult.success) {
+      console.log(
+        `❌ SELL FAILED${
+          sellResult && sellResult.error ? `: ${sellResult.error}` : ''
+        }\n`,
       );
+      return;
+    }
 
-      // Telegram notification con PnL correcto
-      if (process.env.TELEGRAM_OWNER_CHAT_ID && closedPosition) {
-        try {
-          const emoji = pnlData.pnlPercent >= 0 ? '✅' : '❌';
-          const holdTime = (
-            (Date.now() - parseInt(position.entryTime)) /
-            1000
-          ).toFixed(0);
+    const solReceived =
+      sellResult.solReceived ?? sellResult.expectedSOL ?? 0;
 
-          const reasonMap = {
-            wallet_exit_early: '⚡ Phase 1: Wallet Exit',
-            wallet_exit_loss_protection:
-              '🛡️ Phase 2: Loss Protection',
-            take_profit: '💰 Take Profit',
-            trailing_stop: '📉 Trailing Stop',
-            stop_loss: '🛑 Stop Loss',
-            graduation: '🎓 Token Graduated',
-          };
+    if (!solReceived || solReceived <= 0) {
+      console.log(
+        `❌ SELL FAILED: on-chain SOL received == 0 for ${mint.slice(
+          0,
+          8,
+        )}... Keeping position OPEN.\n`,
+      );
+      return;
+    }
 
-          await sendTelegramAlert(
-            process.env.TELEGRAM_OWNER_CHAT_ID,
-            `${emoji} ${mode} EXIT: ${
-              reasonMap[reason] || reason
-            }\n\n` +
-              `Token: ${mint.slice(0, 16)}...\n` +
-              `Executor: ${executorLabel}\n` +
-              `Hold: ${holdTime}s\n\n` +
-              `Entry: $${parseFloat(
-                position.entryPrice,
-              ).toFixed(10)}\n` +
-              `Exit: $${exitPrice.toFixed(10)}\n\n` +
-              `💰 PnL: ${
-                pnlData.pnlPercent >= 0 ? '+' : ''
-              }${pnlData.pnlPercent}% ` +
-              `(${
-                pnlData.pnlSOL >= 0 ? '+' : ''
-              }${pnlData.pnlSOL} SOL)\n` +
-              `📊 Price Change: ${
-                pnlData.priceChangePercent >= 0 ? '+' : ''
-              }${pnlData.priceChangePercent}%\n` +
-              `💸 Fees Impact: ${(
-                pnlData.pnlPercent - pnlData.priceChangePercent
-              ).toFixed(2)}%\n\n` +
-              `Net Received: ${pnlData.netReceived} SOL`,
-            false,
-          );
-        } catch (e) {
-          console.log('⚠️ Telegram notification failed');
-        }
+    const mode = DRY_RUN ? '📄 PAPER' : '💰 LIVE';
+
+    console.log(`${mode} SELL EXECUTED via ${executorLabel}`);
+    console.log(`   SOL received: ${solReceived}`);
+    console.log(`   Signature: ${sellResult.signature}\n`);
+
+    // ✅ CALCULAR PnL CORRECTO CON FEES REALES (basado en modelo)
+    const pnlData = PnLCalculator.calculatePnL({
+      entryPrice: parseFloat(position.entryPrice),
+      exitPrice: exitPrice,
+      tokenAmount: tokensAmountUi,
+      solSpent: parseFloat(position.solAmount),
+      executor: executor,
+      slippage: 0, // En producción, podríamos derivarlo de solReceived vs teórico
+      networkFee: 0.000005,
+      priorityFee: Number(process.env.PRIORITY_FEE || '0.0005'),
+    });
+
+    // Verificar discrepancias (útil para debug)
+    PnLCalculator.checkDiscrepancy({
+      entryPrice: parseFloat(position.entryPrice),
+      exitPrice: exitPrice,
+      tokenAmount: tokensAmountUi,
+      solSpent: parseFloat(position.solAmount),
+      executor: executor,
+    });
+
+    // Cerrar posición con PnL correcto
+    const closedPosition = await positionManager.closePosition(
+      mint,
+      exitPrice,
+      tokensAmountUi,
+      pnlData.netReceived, // Usar el valor neto calculado
+      reason,
+      sellResult.signature,
+    );
+
+    // Telegram notification con PnL correcto
+    if (process.env.TELEGRAM_OWNER_CHAT_ID && closedPosition) {
+      try {
+        const emoji = pnlData.pnlPercent >= 0 ? '✅' : '❌';
+        const holdTime = (
+          (Date.now() - parseInt(position.entryTime)) /
+          1000
+        ).toFixed(0);
+
+        const reasonMap = {
+          wallet_exit_early: '⚡ Phase 1: Wallet Exit',
+          wallet_exit_loss_protection: '🛡️ Phase 2: Loss Protection',
+          take_profit: '💰 Take Profit',
+          trailing_stop: '📉 Trailing Stop',
+          stop_loss: '🛑 Stop Loss',
+          graduation: '🎓 Token Graduated',
+        };
+
+        await sendTelegramAlert(
+          process.env.TELEGRAM_OWNER_CHAT_ID,
+          `${emoji} ${mode} EXIT: ${
+            reasonMap[reason] || reason
+          }\n\n` +
+            `Token: ${mint.slice(0, 16)}...\n` +
+            `Executor: ${executorLabel}\n` +
+            `Hold: ${holdTime}s\n\n` +
+            `Entry: $${parseFloat(position.entryPrice).toFixed(10)}\n` +
+            `Exit: $${exitPrice.toFixed(10)}\n\n` +
+            `💰 PnL: ${
+              pnlData.pnlPercent >= 0 ? '+' : ''
+            }${pnlData.pnlPercent}% ` +
+            `(${
+              pnlData.pnlSOL >= 0 ? '+' : ''
+            }${pnlData.pnlSOL} SOL)\n` +
+            `📊 Price Change: ${
+              pnlData.priceChangePercent >= 0 ? '+' : ''
+            }${pnlData.priceChangePercent}%\n` +
+            `💸 Fees Impact: ${(
+              pnlData.pnlPercent - pnlData.priceChangePercent
+            ).toFixed(2)}%\n\n` +
+            `Net Received: ${pnlData.netReceived} SOL`,
+          false,
+        );
+      } catch (e) {
+        console.log('⚠️ Telegram notification failed');
       }
-    } else {
-      console.log(`❌ SELL FAILED: ${sellResult.error}\n`);
     }
   } catch (error) {
     console.error('❌ Error executing sell:', error.message);
@@ -1113,12 +1234,8 @@ async function sendPnLUpdate(
     const pnlSOL = currentSolValue - solSpent;
 
     const sellCount =
-      (await redis.scard(
-        `upvotes:${position.mint}:sellers`,
-      )) || 0;
-    const minToSell = parseInt(
-      process.env.MIN_WALLETS_TO_SELL || '1',
-    );
+      (await redis.scard(`upvotes:${position.mint}:sellers`)) || 0;
+    const minToSell = parseInt(process.env.MIN_WALLETS_TO_SELL || '1');
 
     const holdTimeMs = Date.now() - parseInt(position.entryTime);
     let phaseInfo = '';
@@ -1153,12 +1270,10 @@ async function sendPnLUpdate(
         `Max: $${maxPrice.toFixed(10)}\n` +
         `\n` +
         `💰 PnL: ${
-          pnlPercent >= 0 ? '+'
-            : ''
+          pnlPercent >= 0 ? '+' : ''
         }${pnlPercent.toFixed(2)}% ` +
         `(${
-          pnlSOL >= 0 ? '+'
-            : ''
+          pnlSOL >= 0 ? '+' : ''
         }${pnlSOL.toFixed(4)} SOL)\n` +
         `⏱️ Hold: ${holdTime}s\n` +
         `🎯 Upvotes: ${upvotes}\n` +
@@ -1185,20 +1300,10 @@ setInterval(async () => {
 }, 60000);
 
 console.log('🚀 Copy Monitor HYBRID strategy started');
-console.log(
-  `   Mode: ${
-    DRY_RUN ? '📄 PAPER TRADING' : '💰 LIVE TRADING'
-  }`,
-);
-console.log(
-  `   Pump.fun: PumpPortal Local API (1.75% fee)`,
-);
-console.log(
-  `   Graduated: Jupiter Ultra Swap (~0.3%)`,
-);
-console.log(
-  `   🎯 HYBRID exit: Phase 1-3 with trailing stop\n`,
-);
+console.log(`   Mode: ${DRY_RUN ? '📄 PAPER TRADING' : '💰 LIVE TRADING'}`);
+console.log(`   Pump.fun: PumpPortal Local API (1.75% fee)`);
+console.log(`   Graduated: Jupiter Ultra Swap (~0.3%)`);
+console.log(`   🎯 HYBRID exit: Phase 1-3 with trailing stop\n`);
 
 Promise.all([
   processCopySignals(),
